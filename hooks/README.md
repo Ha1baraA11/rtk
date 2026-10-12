@@ -4,9 +4,9 @@
 
 **Deployed hook artifacts** — the files and agent-specific configuration installed on user machines by `rtk init`. External scripts and plugins are thin delegates to `rtk rewrite`; native processors such as Codex call the same Rust rewrite registry directly. Zero filtering logic is duplicated in this directory.
 
-Owns: per-agent hook scripts and configuration files for 12 supported agents (Claude Code, Copilot, Cursor, Cline, Windsurf, Codex, OpenCode, Hermes, Pi, Oh My Pi, Mistral Vibe, Trae).
+Owns: per-agent hook scripts and configuration files for 13 supported agents (Claude Code, Copilot, Cursor, Cline, Windsurf, Codex, OpenCode, Hermes, Pi, Oh My Pi, Mistral Vibe, Trae, Google Antigravity).
 
-Does **not** own: hook installation/uninstallation (that's `src/hooks/init.rs`), the rewrite pattern registry (that's `discover/registry`), or integrity verification (that's `src/hooks/integrity.rs`).
+Does **not** own: hook installation/uninstallation (that's `src/hooks/init/`), the rewrite pattern registry (that's `discover/registry`), or integrity verification (that's `src/hooks/integrity.rs`).
 
 Relationship to `src/hooks/`: that component **creates** these files; this directory **contains** them.
 
@@ -46,10 +46,11 @@ Each agent subdirectory has its own README with hook-specific details:
 - **[`cline/`](cline/README.md)** — Rules file (prompt-level), `.clinerules` project-local installation
 - **[`windsurf/`](windsurf/README.md)** — Rules file (prompt-level), `.windsurfrules` workspace-scoped
 - **[`codex/`](codex/README.md)** — Rust binary hook (`rtk hook codex`), `PreToolUse.updatedInput`, `.codex/hooks.json` / `$CODEX_HOME/hooks.json`, plus `AGENTS.md` awareness
-- **[`opencode/`](opencode/README.md)** — TypeScript plugin, `zx` library, `tool.execute.before` event, in-place mutation
+- **[`opencode/`](opencode/README.md)** — TypeScript plugin, OpenCode 2.0 and 1.x >= 1.18.29, in-place mutation
 - **[`pi/`](pi/README.md)** — TypeScript extension, `tool_call` event, local `isBashToolCallEvent` guard, in-place mutation, `~/.pi/agent/extensions/`; **shared with Oh My Pi (OMP)** — OMP installs the same file at `.omp/extensions/` via its `legacy-pi-compat` layer
 - **[`hermes/`](hermes/README.md)** — Python plugin, `pre_tool_call` hook, in-place terminal command mutation
 - **[`vibe/`](vibe/README.md)** — Rust binary hook (`rtk hook vibe`), `pre_tool` entry in `~/.vibe/hooks.toml`, `hook_specific_output.tool_input` rewrite plus `system_message` for UI visibility
+- **[`antigravity/`](antigravity/README.md)** — Rust binary hook (`rtk hook antigravity`), `PreToolUse` plugin entry in `.agents/plugins/rtk/hooks.json` or `~/.gemini/config/plugins/rtk/hooks.json`, transparent rewrite via `overwrite.CommandLine`
 
 ## Supported Agents
 
@@ -60,11 +61,12 @@ Each agent subdirectory has its own README with hook-specific details:
 | GitHub Copilot CLI | Rust binary (`rtk hook copilot`) | Deny-with-suggestion | No (agent retries) |
 | Cursor | Rust binary | Transparent rewrite | Yes (`updated_input`) |
 | Trae | Rust binary (`rtk hook trae`) | Transparent rewrite | Yes (`updatedInput`) |
+| Google Antigravity | Rust binary (`rtk hook antigravity`) | Transparent rewrite | Yes (`overwrite.CommandLine`) |
 | Gemini CLI | Rust binary (`rtk hook gemini`) | Transparent rewrite | Yes (`hookSpecificOutput`) |
 | Cline / Roo Code | Custom instructions (rules file) | Prompt-level guidance | N/A |
 | Windsurf | Custom instructions (rules file) | Prompt-level guidance | N/A |
 | Codex CLI | Rust binary (`rtk hook codex`) | Transparent rewrite | Yes (`updatedInput`) |
-| OpenCode | TypeScript plugin (`tool.execute.before`) | In-place mutation | Yes |
+| OpenCode | TypeScript plugin (`execute.before` in 2.0, `tool.execute.before` in 1.x >= 1.18.29) | In-place mutation | Yes |
 | Pi | TypeScript extension (`tool_call` event) | In-place mutation | Yes |
 | Oh My Pi (OMP) | TypeScript extension (`tool_call` event, shared with Pi) | In-place mutation | Yes |
 | Hermes | Python plugin (`pre_tool_call`) | In-place mutation | Yes |
@@ -248,15 +250,59 @@ The `allow` value is required by Codex to accept `updatedInput`; Codex still run
 
 **No rewrite**: exit 0 with empty stdout (Vibe's contract for "no opinion" from a `pre_tool` hook).
 
+### Google Antigravity (Rust Binary)
+
+**Input** (stdin):
+
+```json
+{
+  "toolCall": {
+    "name": "run_command",
+    "args": { "CommandLine": "git status" }
+  }
+}
+```
+
+**Output** (when rewritten):
+
+```json
+{
+  "decision": "allow",
+  "reason": "Rewritten by rtk for token optimization.",
+  "overwrite": {
+    "CommandLine": "rtk git status"
+  }
+}
+```
+
+**No rewrite**: `{"decision": "allow"}`
+
 ### OpenCode (TypeScript Plugin)
 
-Mutates `args.command` in-place via the zx library:
+Delegates to `rtk hook opencode` via `node:child_process.execFile` (supports [OpenCode 2.0 and 1.x >= 1.18.29](opencode/README.md)). The Rust side owns the rewrite rules and the permission verdict; the plugin only carries it. The hook must be awaited — `args.command = …` after the call returns has nothing left to rewrite:
 
 ```typescript
-const result = await $`rtk rewrite ${command}`.quiet().nothrow()
-const rewritten = String(result.stdout).trim()
-if (rewritten && rewritten !== command) {
-  (args as Record<string, unknown>).command = rewritten
+const tool = String(input?.tool ?? "").toLowerCase()
+if (tool === "bash" || tool === "shell") {
+  // 2.x also has `event.agent`, which rtk needs so an agent-scoped ask or deny
+  // is judged against the agent that runs the command. 1.x sends no agent.
+  const argv = ["hook", "opencode"]
+  if (agent) argv.push("--agent", agent)
+  argv.push(command)
+  const rewritten = await new Promise((resolve) => {
+    execFile(rtkBin, argv, { encoding: "utf8", timeout: 3000, windowsHide: true }, (err, stdout) => {
+      if (err) return resolve(null) // pass through unchanged
+      try {
+        resolve(JSON.parse(String(stdout ?? "").trim() || "{}").command ?? null)
+      } catch {
+        resolve(null)
+      }
+    })
+  })
+  // {} means the rewrite would change OpenCode's own verdict — run as typed.
+  if (rewritten && rewritten !== command) {
+    args.command = rewritten
+  }
 }
 ```
 
@@ -332,7 +378,7 @@ New integrations must follow the [Exit Code Contract](#exit-code-contract) and [
 
 | Tier | Mechanism | Maintenance | Examples |
 |------|-----------|-------------|----------|
-| **Full hook** | Shell script or Rust binary, intercepts commands via agent's hook API | High — must track agent API changes | Claude Code, Cursor, Copilot, Gemini, Codex |
+| **Full hook** | Shell script or Rust binary, intercepts commands via agent's hook API | High — must track agent API changes | Claude Code, Cursor, Copilot, Gemini, Codex, Antigravity |
 | **Plugin** | TypeScript/JS/Python plugin in agent's plugin system | Medium — agent manages loading | OpenCode, Hermes, Pi, Oh My Pi |
 | **Rules file** | Prompt-level instructions the agent reads | Low — no code to break | Cline, Windsurf |
 
